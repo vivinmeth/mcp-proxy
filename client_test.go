@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -614,4 +616,192 @@ func TestNilOptionsClientDoesNotPanicOnConnect(t *testing.T) {
 	// Let the keepalive task run a tick; a nil dereference there crashes the
 	// process rather than this goroutine.
 	time.Sleep(100 * time.Millisecond)
+}
+
+func TestForwardableMetaStripsProtocolEnvelope(t *testing.T) {
+	t.Parallel()
+
+	envelope := map[string]any{
+		mcp.MetaKeyProtocolVersion:     "2026-07-28",
+		mcp.MetaKeyClientInfo:          map[string]any{"name": "claude-code", "version": "2.1.310"},
+		mcp.MetaKeyClientCapabilities:  map[string]any{},
+		mcp.MetaKeyLogLevel:            "info",
+		"io.modelcontextprotocol/next": true,
+	}
+
+	tests := []struct {
+		name string
+		in   *mcp.Meta
+		want *mcp.Meta
+	}{
+		{name: "nil", in: nil, want: nil},
+		{
+			name: "only envelope keys is dropped entirely",
+			in:   &mcp.Meta{AdditionalFields: maps.Clone(envelope)},
+			want: nil,
+		},
+		{
+			name: "progressToken and vendor keys survive",
+			in: &mcp.Meta{ProgressToken: "tok-1", AdditionalFields: func() map[string]any {
+				fields := maps.Clone(envelope)
+				fields["com.example/trace"] = "abc"
+				// Only the exact reserved prefix is protocol-owned.
+				fields["io.modelcontextprotocol.example/x"] = 1
+				return fields
+			}()},
+			want: &mcp.Meta{ProgressToken: "tok-1", AdditionalFields: map[string]any{
+				"com.example/trace":                 "abc",
+				"io.modelcontextprotocol.example/x": 1,
+			}},
+		},
+		{
+			name: "progressToken alone",
+			in:   &mcp.Meta{ProgressToken: 7, AdditionalFields: maps.Clone(envelope)},
+			want: &mcp.Meta{ProgressToken: 7},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var before map[string]any
+			if tt.in != nil {
+				before = maps.Clone(tt.in.AdditionalFields)
+			}
+			got := forwardableMeta(tt.in)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("forwardableMeta() = %#v, want %#v", got, tt.want)
+			}
+			// The inbound request is shared with the route server; it must not be
+			// mutated in place.
+			if tt.in != nil && !reflect.DeepEqual(tt.in.AdditionalFields, before) {
+				t.Errorf("forwardableMeta mutated its input: %#v", tt.in.AdditionalFields)
+			}
+		})
+	}
+}
+
+// The handler-level check: a tool call, prompt get and resource read carrying a
+// 2026-07-28 envelope reach a legacy downstream without it, and with the other
+// _meta keys intact.
+func TestForwardedRequestsDropProtocolEnvelope(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu    sync.Mutex
+		metas = map[string]map[string]any{}
+	)
+	record := func(method string) func(ctx context.Context, id any, message any) {
+		return func(ctx context.Context, id any, message any) {
+			encoded, _ := json.Marshal(message)
+			var decoded struct {
+				Params struct {
+					Meta map[string]any `json:"_meta"`
+				} `json:"params"`
+			}
+			_ = json.Unmarshal(encoded, &decoded)
+			mu.Lock()
+			metas[method] = decoded.Params.Meta
+			mu.Unlock()
+		}
+	}
+	hooks := &server.Hooks{}
+	hooks.AddBeforeCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest) {
+		record("tools/call")(ctx, id, message)
+	})
+	hooks.AddBeforeGetPrompt(func(ctx context.Context, id any, message *mcp.GetPromptRequest) {
+		record("prompts/get")(ctx, id, message)
+	})
+	hooks.AddBeforeReadResource(func(ctx context.Context, id any, message *mcp.ReadResourceRequest) {
+		record("resources/read")(ctx, id, message)
+	})
+
+	downstream := server.NewMCPServer("downstream", "1.0.0", server.WithHooks(hooks),
+		server.WithToolCapabilities(true), server.WithPromptCapabilities(true), server.WithResourceCapabilities(true, true))
+	downstream.AddTool(mcp.NewTool("echo"), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+	downstream.AddPrompt(mcp.NewPrompt("greet"), func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		return mcp.NewGetPromptResult("greet", []mcp.PromptMessage{mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent("hi"))}), nil
+	})
+	downstream.AddResource(mcp.NewResource("test://r", "r"), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		return []mcp.ResourceContents{mcp.TextResourceContents{URI: "test://r", Text: "r"}}, nil
+	})
+	// Pin the downstream to an older revision, like the hosted servers that
+	// reject a body envelope disagreeing with the MCP-Protocol-Version header.
+	httpServer := httptest.NewServer(server.NewStreamableHTTPServer(downstream,
+		server.WithStateLess(true), server.WithStreamableHTTPProtocolVersions(mcp.LATEST_LEGACY_PROTOCOL_VERSION)))
+	t.Cleanup(httpServer.Close)
+
+	c, err := newMCPClient("legacy", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           httpServer.URL,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	route := server.NewMCPServer("legacy", "1.0.0", server.WithResourceCapabilities(true, true))
+	if err := c.connect(t.Context(), mcp.Implementation{Name: "proxy", Version: "1"}, route); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if v := c.getClient().ProtocolVersion(); mcp.IsModernProtocol(v) {
+		t.Fatalf("downstream negotiated %q, want a legacy revision for this test", v)
+	}
+
+	inbound := func() *mcp.Meta {
+		return &mcp.Meta{ProgressToken: "tok", AdditionalFields: map[string]any{
+			mcp.MetaKeyProtocolVersion:    "2026-07-28",
+			mcp.MetaKeyClientInfo:         map[string]any{"name": "claude-code", "version": "2.1.310"},
+			mcp.MetaKeyClientCapabilities: map[string]any{},
+			"com.example/trace":           "abc",
+		}}
+	}
+
+	toolRequest := mcp.CallToolRequest{}
+	toolRequest.Params.Name = "echo"
+	toolRequest.Params.Meta = inbound()
+	if _, err := c.callTool(t.Context(), toolRequest); err != nil {
+		t.Fatalf("callTool: %v", err)
+	}
+	if _, ok := toolRequest.Params.Meta.AdditionalFields[mcp.MetaKeyProtocolVersion]; !ok {
+		t.Error("callTool mutated the caller's _meta")
+	}
+
+	promptRequest := mcp.GetPromptRequest{}
+	promptRequest.Params.Name = "greet"
+	promptRequest.Params.Meta = inbound()
+	prompt, ok := route.ListPrompts()["greet"]
+	if !ok {
+		t.Fatal("prompt greet was not registered on the route")
+	}
+	if _, err := prompt.Handler(t.Context(), promptRequest); err != nil {
+		t.Fatalf("get prompt: %v", err)
+	}
+
+	resourceRequest := mcp.ReadResourceRequest{}
+	resourceRequest.Params.URI = "test://r"
+	resourceRequest.Params.Meta = inbound()
+	if _, err := c.readResource(t.Context(), resourceRequest); err != nil {
+		t.Fatalf("readResource: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, method := range []string{"tools/call", "prompts/get", "resources/read"} {
+		meta, ok := metas[method]
+		if !ok {
+			t.Errorf("%s never reached the downstream", method)
+			continue
+		}
+		for key := range meta {
+			if strings.HasPrefix(key, protocolMetaPrefix) {
+				t.Errorf("%s forwarded envelope key %q", method, key)
+			}
+		}
+		if meta["progressToken"] != "tok" || meta["com.example/trace"] != "abc" {
+			t.Errorf("%s _meta = %v, want progressToken and vendor key kept", method, meta)
+		}
+	}
 }

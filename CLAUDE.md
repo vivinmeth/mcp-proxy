@@ -39,6 +39,7 @@ Key behaviors to preserve:
 - `Client.Close` swallows `*exec.ExitError`: a stdio server that exits non-zero when its stdin closes is not a shutdown failure, and would otherwise make the proxy exit non-zero.
 - `shutdown` sets `shuttingDown` before it walks the clients map, and a startup goroutine that finishes after that closes its own client. `newMCPClient` takes no context and has already spawned the subprocess, so `cancel()` alone would leak it.
 - OAuth dynamic client registration (empty `clientId`) is reloaded from disk on daemon start; without this, token refresh silently fails.
+- Forwarded tool calls, prompt gets and resource reads drop the client's `io.modelcontextprotocol/*` `_meta` keys (`forwardableMeta` in `client.go`). That envelope describes the client↔proxy session; the proxy↔downstream one is negotiated separately and may be older, and a downstream that checks the body against `MCP-Protocol-Version` rejects the mismatch. Other `_meta` keys (`progressToken`, vendor keys) pass through.
 
 ## Tests
 

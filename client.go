@@ -437,6 +437,45 @@ func redactURLCredentials(err error) error {
 	return &redactedError{msg: message, err: err}
 }
 
+// protocolMetaPrefix is the reserved _meta namespace protocol version
+// 2026-07-28 uses for the per-request envelope (protocolVersion, clientInfo,
+// clientCapabilities, logLevel, ...).
+const protocolMetaPrefix = "io.modelcontextprotocol/"
+
+// forwardableMeta returns the _meta to send downstream for a request received
+// from a client, without the protocol envelope keys.
+//
+// Those keys describe the client-to-proxy connection, which is negotiated
+// separately from the proxy-to-downstream one. Forwarding them verbatim makes a
+// 2026-07-28 client's envelope reach a downstream whose session is on an older
+// revision, and a server that checks the body against the MCP-Protocol-Version
+// header rejects every call ("the body envelope names protocol version
+// 2026-07-28 but the MCP-Protocol-Version header names 2025-11-25"). On a
+// modern downstream connection mcp-go writes its own envelope anyway.
+//
+// Every other key (progressToken, vendor keys, trace context) is kept. The
+// inbound Meta is not modified, and nil is returned when nothing is left so the
+// field is omitted rather than sent as an empty object.
+func forwardableMeta(meta *mcp.Meta) *mcp.Meta {
+	if meta == nil {
+		return nil
+	}
+	fields := make(map[string]any, len(meta.AdditionalFields))
+	for key, value := range meta.AdditionalFields {
+		if strings.HasPrefix(key, protocolMetaPrefix) {
+			continue
+		}
+		fields[key] = value
+	}
+	if meta.ProgressToken == nil && len(fields) == 0 {
+		return nil
+	}
+	if len(fields) == 0 {
+		fields = nil
+	}
+	return &mcp.Meta{ProgressToken: meta.ProgressToken, AdditionalFields: fields}
+}
+
 // callTool forwards a tool call to the downstream, bounded by requestTimeout
 // when one is configured.
 //
@@ -455,6 +494,7 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
+	request.Params.Meta = forwardableMeta(request.Params.Meta)
 	result, err := cl.CallTool(callCtx, request)
 	return result, redactURLCredentials(err)
 }
@@ -749,6 +789,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 				}
 				callCtx, cancel := c.withRequestTimeout(ctx)
 				defer cancel()
+				request.Params.Meta = forwardableMeta(request.Params.Meta)
 				result, err := live.GetPrompt(callCtx, request)
 				return result, redactURLCredentials(err)
 			}})
@@ -852,6 +893,7 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
+	request.Params.Meta = forwardableMeta(request.Params.Meta)
 	readResource, err := cl.ReadResource(callCtx, request)
 	if err != nil {
 		return nil, redactURLCredentials(err)

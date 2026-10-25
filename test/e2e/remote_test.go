@@ -74,6 +74,13 @@ func (d *downstreamRecorder) values(key string) []string {
 // newDownstreamHandler builds the minimal echo MCP server these tests proxy to,
 // returning the handler and the route suffix its transport expects.
 func newDownstreamHandler(transportType string) (http.Handler, string) {
+	return newDownstreamHandlerWithOptions(transportType)
+}
+
+// newDownstreamHandlerWithOptions is newDownstreamHandler with extra options
+// for the streamable-http transport, e.g. to pin the protocol revisions it
+// accepts.
+func newDownstreamHandlerWithOptions(transportType string, streamableOptions ...server.StreamableHTTPOption) (http.Handler, string) {
 	mcpServer := server.NewMCPServer("downstream", "1.0.0", server.WithToolCapabilities(true))
 	mcpServer.AddTool(
 		mcp.NewTool("echo", mcp.WithString("message", mcp.Required())),
@@ -89,7 +96,8 @@ func newDownstreamHandler(transportType string) (http.Handler, string) {
 	if transportType == "sse" {
 		return server.NewSSEServer(mcpServer), "/sse"
 	}
-	return server.NewStreamableHTTPServer(mcpServer, server.WithStateLess(true)), "/mcp"
+	streamableOptions = append([]server.StreamableHTTPOption{server.WithStateLess(true)}, streamableOptions...)
+	return server.NewStreamableHTTPServer(mcpServer, streamableOptions...), "/mcp"
 }
 
 // startDownstreamOnAddr serves the standard echo downstream on a fixed address,
@@ -176,6 +184,33 @@ func TestRemoteServerTransports(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A 2026-07-28 client puts its protocol envelope in every request's _meta. The
+// proxy's own session with the downstream is negotiated separately, and here it
+// lands on an older revision, so forwarding the client's envelope would name
+// 2026-07-28 in the body while the MCP-Protocol-Version header names the older
+// one - and a downstream that checks the two (mcp-go does, as do hosted servers
+// such as vidIQ) rejects every call.
+func TestModernClientThroughLegacyDownstream(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	handler, suffix := newDownstreamHandlerWithOptions("streamable-http",
+		server.WithStreamableHTTPProtocolVersions(mcp.LATEST_LEGACY_PROTOCOL_VERSION))
+	downstream := httptest.NewServer(handler)
+	t.Cleanup(downstream.Close)
+
+	configPath, addr := remoteConfig(t, "streamable-http", downstream.URL+suffix)
+	proxy := startProxy(t, configPath, addr)
+
+	mcpClient := proxy.connect(t, "streamable-http", "remote")
+	if v := mcpClient.ProtocolVersion(); !mcp.IsModernProtocol(v) {
+		t.Fatalf("client negotiated %q with the proxy, want a 2026-07-28-era revision", v)
+	}
+	if got := callToolText(t, mcpClient, "echo", map[string]any{"message": "hi"}); got != "downstream:hi" {
+		t.Errorf("echo through a legacy downstream = %q, want %q", got, "downstream:hi")
 	}
 }
 
