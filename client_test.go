@@ -800,8 +800,10 @@ func TestForwardedRequestsDropProtocolEnvelope(t *testing.T) {
 				t.Errorf("%s forwarded envelope key %q", method, key)
 			}
 		}
-		if meta["progressToken"] != "tok" || meta["com.example/trace"] != "abc" {
-			t.Errorf("%s _meta = %v, want progressToken and vendor key kept", method, meta)
+		// The progress token is kept, but as the proxy's own (see progressRelay).
+		token, _ := meta["progressToken"].(string)
+		if !strings.HasPrefix(token, progressTokenPrefix) || meta["com.example/trace"] != "abc" {
+			t.Errorf("%s _meta = %v, want a progressToken and the vendor key kept", method, meta)
 		}
 	}
 }

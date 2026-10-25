@@ -338,6 +338,13 @@ func mcpPath(serverType, name string) string {
 
 func (p *proxy) connect(t *testing.T, serverType, name string) *client.Client {
 	t.Helper()
+	return p.connectAs(t, serverType, name, mcp.LATEST_PROTOCOL_VERSION)
+}
+
+// connectAs is connect for a client that asks for protocolVersion, e.g. a
+// 2025-era revision instead of the latest.
+func (p *proxy) connectAs(t *testing.T, serverType, name, protocolVersion string) *client.Client {
+	t.Helper()
 
 	endpoint := p.baseURL + mcpPath(serverType, name)
 	headers := map[string]string{"Authorization": "Bearer " + testAuthToken}
@@ -361,7 +368,7 @@ func (p *proxy) connect(t *testing.T, serverType, name string) *client.Client {
 	}
 
 	initRequest := mcp.InitializeRequest{}
-	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.ProtocolVersion = protocolVersion
 	initRequest.Params.ClientInfo = mcp.Implementation{Name: "e2e", Version: "1.0.0"}
 	result, err := mcpClient.Initialize(ctx, initRequest)
 	if err != nil {

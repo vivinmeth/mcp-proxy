@@ -129,10 +129,10 @@ func checkTools(t *testing.T, mcpClient *client.Client) {
 		names = append(names, tool.Name)
 	}
 	slices.Sort(names)
-	// The fixture registers eight tools and serves them two per page, so a
+	// The fixture registers nine tools and serves them two per page, so a
 	// complete list proves both that the block filter dropped "blocked" and
 	// that multi-page listing works end to end.
-	want := []string{"add", "echo", "fail", "getenv", "hang", "noisy_stderr", "pid"}
+	want := []string{"add", "echo", "fail", "getenv", "hang", "noisy_stderr", "pid", "progress"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("tools = %v, want %v (blocked tool filtered, all pages fetched)", names, want)
 	}
@@ -169,6 +169,16 @@ func checkTools(t *testing.T, mcpClient *client.Client) {
 		if text := resultText(t, result); !strings.Contains(text, "intentional tool failure") {
 			t.Errorf("fail result = %q, want the downstream error message", text)
 		}
+	})
+
+	// The stdio transport is never started through mcp-go's Client, so its
+	// notifications reach the relay by a different hook than http ones do.
+	t.Run("progress relayed", func(t *testing.T) {
+		progress := collectProgress(mcpClient)
+		if got := callToolWithProgress(t, mcpClient, "progress", map[string]any{"steps": 3}, "stdio-token"); got != "done" {
+			t.Errorf("progress = %q, want %q", got, "done")
+		}
+		checkProgress(t, progress.take(), "stdio-token", 3)
 	})
 
 	t.Run("blocked tool unreachable", func(t *testing.T) {

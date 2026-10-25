@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -149,6 +150,34 @@ func addTools(s *server.MCPServer) {
 		mcp.NewTool("fail", mcp.WithDescription("Always fail with a tool error")),
 		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return mcp.NewToolResultError("intentional tool failure"), nil
+		},
+	)
+
+	// progress reports steps progress notifications against the request's
+	// progress token, pausing before each, so the test can check the proxy
+	// relays them to the caller.
+	s.AddTool(
+		mcp.NewTool("progress",
+			mcp.WithDescription("Report progress before answering"),
+			mcp.WithNumber("steps", mcp.Required()),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			steps, err := request.RequireFloat("steps")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if meta := request.Params.Meta; meta != nil && meta.ProgressToken != nil {
+				for i := 1; i <= int(steps); i++ {
+					time.Sleep(20 * time.Millisecond)
+					_ = server.ServerFromContext(ctx).SendNotificationToClient(ctx, string(mcp.MethodNotificationProgress), map[string]any{
+						"progressToken": meta.ProgressToken,
+						"progress":      i,
+						"total":         int(steps),
+					})
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			return mcp.NewToolResultText("done"), nil
 		},
 	)
 

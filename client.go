@@ -70,6 +70,11 @@ type Client struct {
 	clientInfo mcp.Implementation
 	mcpServer  *server.MCPServer
 	pingOnce   sync.Once
+
+	// progress maps the progress tokens sent downstream back to the client
+	// requests waiting for them. It outlives reconnects, so a token issued on
+	// one transport stays unique on the next.
+	progress progressRelay
 }
 
 func (c *Client) Health() clientHealth {
@@ -146,6 +151,24 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 // backend (closed Obsidian, crashed stdio server) is replaced rather than
 // reused.
 func (c *Client) buildRawClient() (*client.Client, error) {
+	raw, err := c.newRawClient()
+	if err != nil {
+		return nil, err
+	}
+	// Client.Start is what connects the transport's notifications to the
+	// client's handlers, and the stdio constructor starts the transport itself,
+	// so a stdio client is never started through it: its transport gets the
+	// handler directly.
+	if c.needManualStart {
+		raw.OnNotification(c.progress.relay)
+	} else {
+		raw.GetTransport().SetNotificationHandler(c.progress.relay)
+	}
+	return raw, nil
+}
+
+// newRawClient builds the mcp-go client for the configured transport.
+func (c *Client) newRawClient() (*client.Client, error) {
 	switch v := c.clientConf.(type) {
 	case *StdioMCPClientConfig:
 		envs := make([]string, 0, len(v.Env))
@@ -494,7 +517,9 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
-	request.Params.Meta = forwardableMeta(request.Params.Meta)
+	meta, release := c.progress.track(ctx, forwardableMeta(request.Params.Meta))
+	defer release()
+	request.Params.Meta = meta
 	result, err := cl.CallTool(callCtx, request)
 	return result, redactURLCredentials(err)
 }
@@ -789,7 +814,9 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 				}
 				callCtx, cancel := c.withRequestTimeout(ctx)
 				defer cancel()
-				request.Params.Meta = forwardableMeta(request.Params.Meta)
+				meta, release := c.progress.track(ctx, forwardableMeta(request.Params.Meta))
+				defer release()
+				request.Params.Meta = meta
 				result, err := live.GetPrompt(callCtx, request)
 				return result, redactURLCredentials(err)
 			}})
@@ -893,7 +920,9 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 	}
 	callCtx, cancel := c.withRequestTimeout(ctx)
 	defer cancel()
-	request.Params.Meta = forwardableMeta(request.Params.Meta)
+	meta, release := c.progress.track(ctx, forwardableMeta(request.Params.Meta))
+	defer release()
+	request.Params.Meta = meta
 	readResource, err := cl.ReadResource(callCtx, request)
 	if err != nil {
 		return nil, redactURLCredentials(err)
