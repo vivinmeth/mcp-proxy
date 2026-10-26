@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git
+
+**Git mode: `trunk`** (global rules, Git) on `master` of our fork `vivinmeth/mcp-proxy`. `upstream` is `tbxark/mcp-proxy`: never push to it or open a PR there; our fixes stay in the fork.
+
 ## Project
 
 An MCP proxy server (Go, single `main` package, flat layout) that aggregates multiple downstream MCP servers behind one HTTP entrypoint. Each configured downstream server is exposed at its own route (`<baseURL path>/<serverName>/`) via SSE or streamable HTTP.
